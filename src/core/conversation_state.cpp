@@ -274,14 +274,23 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 }
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
-                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                    const QsaState& draft, std::string& error,
+                                    std::vector<ConversationCheckpoint>* move_checkpoints) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
+    struct Rollback {
+        SavedConversation& image;
+        std::vector<ConversationCheckpoint>* original;
+        bool complete = false;
+        ~Rollback() { if (!complete && original) *original = std::move(image.checkpoints); }
+    } rollback{captured, move_checkpoints};
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    captured.cvec = view.cvec;
+    if (move_checkpoints) captured.checkpoints = std::move(*move_checkpoints);
+    else captured.checkpoints = view.checkpoints;
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
@@ -291,6 +300,7 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
     meta = std::move(captured);
     sources = std::move(out);
+    rollback.complete = true;
     return true;
 }
 
@@ -325,8 +335,8 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     return true;
 }
 
-bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+bool conversation_snapshot_validate_meta(const SavedConversation& image, const SessionState& ss,
+                                         const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
@@ -337,6 +347,16 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
     const size_t layers = owned_qsa(ss);
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
+    const int64_t upto = (int64_t) image.live.ids.size();
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_validate_meta(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
+    return !draft || conversation_kv_validate_meta(image.kv.back(), *draft, g, upto, false, error);
+}
+
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
+                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    if (!conversation_snapshot_validate_meta(image, ss, g, draft, error)) return false;
+    const size_t layers = owned_qsa(ss);
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
@@ -376,6 +396,11 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     // the whole-session form: a layer split's image (stage images) is restored stage by stage, never through here
     if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
     return conversation_snapshot_validate(image, ss, g, &draft, error);
+}
+bool conversation_snapshot_validate_meta(const SavedConversation& image, const SessionState& ss,
+                                         const ModelGeometry& g, const QsaState& draft, std::string& error) {
+    if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
+    return conversation_snapshot_validate_meta(image, ss, g, &draft, error);
 }
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {

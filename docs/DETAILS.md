@@ -948,6 +948,35 @@ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disa
 retention for diagnostic comparisons. Parked snapshots are not
 persisted across restarts; the session files below are.
 
+**Disk tier for the parked conversations (opt-in).** Set `--conversation-cache-spill-dir DIR` to keep a parked
+conversation when RAM pressure or `--conversation-cache-slots` evicts it: the evicted conversation is written to DIR
+as an ordinary session file (the same format and model/configuration identity as the slot save/restore below), so a
+later request - or a restart - can read it back. The directory is scanned at the next start, and a request that
+matches a spilled conversation resumes from it even though it is no longer in RAM. The cache is still off unless
+`--conversation-cache-mib` is nonzero, and `--prompt-cache 0` or `--conversation-cache-slots 0` disables it.
+`--conversation-cache-disk-mib N` caps this model's spill files at 8192 MiB by default; `0` disables the disk tier.
+The index holds at most 256 conversations and evicts the oldest first. On a clean `QUIT` or stdin close, Strata
+captures the active conversation and spills the parked ones before it exits. Use a separate directory per model.
+
+Each spilled conversation is a session file (`.sess`) plus a small metadata sidecar (`.meta`) that holds only its
+token and image lists, so a new request finds the best disk match without reading the conversation's K/V. A file
+whose recorded model or configuration identity differs is refused, and a sidecar whose session file is missing, or
+whose own checksum fails, is removed when the directory is scanned. The identity is the same model fingerprint and
+configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
+file are interchangeable.
+
+`--conversation-cache-similarity F` sets the least longest-common-prefix fraction of the new prompt a disk hit may
+offer (the fraction is `common_prefix_tokens / new_prompt_tokens`, and must be strictly greater than F);
+`--conversation-cache-n-min N` sets the least common-prefix token count. Both default to 0, which keeps every exact
+prefix the RAM cache would have used. Even when a candidate passes the threshold, Strata restores only a saved
+checkpoint whose token and image keys are an exact prefix of the new prompt; the last prompt token stays unread so
+the next verify window starts in the right position.
+
+A disk hit is read into host RAM before it is restored: it must fit the configured RAM cache budget and leave the
+`--conversation-cache-min-free-mib` physical-memory floor available, or the request reads the prompt normally. The
+engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
+limit: with `--layer-split` the disk tier stays off.
+
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
@@ -1029,12 +1058,21 @@ only its own temporary file. Once the rename is done the old file is gone: if th
 fails with `published` set - the new file's bytes are complete and flushed, but its name may not survive a power loss.
 A filesystem that cannot flush a folder (`EINVAL`) is not a failure; the engine logs it. A restore opens `path` without following a symbolic link (or a Windows reparse point) and refuses
 anything but a regular file with one name; it checks the size, the header, both fingerprints (before the payload is
-parsed; the first 16 MiB block, header included, is already read), that the parse's peak (the image, the read buffer, the per-segment overhead) fits in RAM above the parking
+parsed; the first 16 MiB block, header included, is already read), that the read's peak (the running state metadata,
+two 16 MiB block buffers and the small vectors) fits in RAM above the parking
 floor (`--conversation-cache-min-free-mib`), the file's size against the largest this session can restore, the
 geometry and layer range before any state array, and every count against the bytes left and this session's exact
-limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, the payload hash
-and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
-was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
+limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, and the payload hash
+- all before any device write, and a refusal leaves the current session as it was. The K/V itself is not held in RAM:
+after the running state and the K/V headers were validated against this engine, the engine reads the file again and
+copies the K/V into its pools a 16 MiB block at a time; this is what restores a session larger than RAM. The apply
+pass is bound to the read pass: a file whose K/V layer count or any part size differs from what the read pass saw is
+refused before that layer or part is applied, and the payload hash is recomputed and compared to the file's trailer
+at the end. The first applied block is the gate - everything before it can still be refused cleanly; a divergence
+found after it (a same-size edit, or a torn re-read) ends the engine, since the remaining bytes cannot be told apart.
+A complete atomic replacement that is itself self-consistent and keeps the same sizes is not detected: the file must
+have no writer but this engine. A transfer failure after the device
+writes began ends the engine (`FATAL`) rather than decode from a partial
 state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
 `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
