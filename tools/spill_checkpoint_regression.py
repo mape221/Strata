@@ -2,11 +2,11 @@
 """A shared-prefix sibling after 'hola' must not lose its checkpoint to the disk tier."""
 
 import json
+import os
 import urllib.request
 from pathlib import Path
 
 base = "http://127.0.0.1:11436"
-key = Path("/mnt/datos/Strata/strata-api-key").read_text().strip()
 log = Path("/mnt/datos/Strata-spill/checkpoint-regression-engine.log")
 system = {"role": "system", "content": "Responde en español. Prueba de rama del checkpoint sin perder contexto."}
 
@@ -15,7 +15,9 @@ def ask(messages, limit):
     body = json.dumps({"model": "swift-1.5-iq3_xxs", "messages": messages,
                        "temperature": 0, "max_tokens": limit}).encode()
     req = urllib.request.Request(base + "/v1/chat/completions", data=body,
-                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+                                 headers={"Content-Type": "application/json", "X-Session-Id": "checkpoint-A",
+                                          **({"Authorization": "Bearer " + os.environ["STRATA_TEST_API_KEY"]}
+                                             if os.getenv("STRATA_TEST_API_KEY") else {})})
     with urllib.request.urlopen(req, timeout=240) as response:
         data = json.load(response)
     choice = data["choices"][0]

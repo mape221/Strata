@@ -11,11 +11,11 @@ log = root / "sparse-integration-engine.log"
 url = "http://127.0.0.1:11436/v1/chat/completions"
 
 
-def ask(messages):
+def ask(messages, session_id):
     data = json.dumps({"model": "swift-1.5-iq3_xxs", "messages": messages,
                        "max_tokens": 192, "temperature": 0, "enable_thinking": False}).encode()
     with urllib.request.urlopen(urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}), timeout=240) as response:
+            url, data=data, headers={"Content-Type": "application/json", "X-Session-Id": session_id}), timeout=240) as response:
         result = json.load(response)
     choice = result["choices"][0]
     assert choice["message"].get("content") and choice["finish_reason"] in ("stop", "length"), choice
@@ -27,13 +27,13 @@ base = {"role": "system", "content":
         "Esta es la prueba larga de checkpoints SSD. " +
         "Estás ayudando con un pequeño proyecto de matemáticas en español. " * 3500}
 hello = {"role": "user", "content": "hola"}
-first = ask([base, hello])
+first = ask([base, hello], "sparse-A")
 other = ask([{"role": "system", "content": "Eres un ayudante de cocina."},
-             {"role": "user", "content": "Escribe una frase sobre cocinar arroz."}])
+             {"role": "user", "content": "Escribe una frase sobre cocinar arroz."}], "sparse-B")
 # A changed assistant answer branches after the shared first turn. The new prompt should hit the older
 # checkpoint, instead of rereading the entire (longer) shared prefix.
 continued = ask([base, hello, {"role": "assistant", "content": "¡Hola!"},
-                 {"role": "user", "content": "Dime un número primo."}])
+                 {"role": "user", "content": "Dime un número primo."}], "sparse-A")
 events = log.read_bytes()[start:].decode(errors="replace")
 lines = [line for line in events.splitlines() if "disk session:" in line or
          "conversation cache: restored" in line or "strata serve: prompt " in line]

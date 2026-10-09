@@ -10,10 +10,11 @@ log = Path("/mnt/datos/Strata-spill/sparse-integration-engine.log")
 url = "http://127.0.0.1:11436/v1/chat/completions"
 
 
-def ask(messages):
+def ask(messages, session_id):
     body = json.dumps({"model": "swift-1.5-iq3_xxs", "messages": messages,
                        "max_tokens": 192, "temperature": 0, "enable_thinking": False}).encode()
-    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json", "X-Session-Id": session_id})
     with urllib.request.urlopen(request, timeout=240) as response:
         result = json.load(response)
     assert result["choices"][0]["message"].get("content")
@@ -22,12 +23,12 @@ def ask(messages):
 
 start = log.stat().st_size
 ask([{"role": "system", "content": "Eres un ayudante de cocina."},
-     {"role": "user", "content": "Escribe una frase sobre cocinar arroz."}])
+     {"role": "user", "content": "Escribe una frase sobre cocinar arroz."}], "sparse-B")
 phrase = "Estás ayudando con un pequeño proyecto de matemáticas en español. "
 system = "Esta es la prueba larga de checkpoints SSD. " + phrase * 1000 + "Cambio de rama. " + phrase * 2500
 length = ask([{"role": "system", "content": system}, {"role": "user", "content": "hola"},
               {"role": "assistant", "content": "¡Hola!"},
-              {"role": "user", "content": "Dime un número primo."}])
+              {"role": "user", "content": "Dime un número primo."}], "sparse-A")
 events = log.read_bytes()[start:].decode(errors="replace")
 print("\n".join(x for x in events.splitlines() if "conversation cache: restored" in x or
                 "strata serve: prompt " in x or "disk session skipped" in x), flush=True)

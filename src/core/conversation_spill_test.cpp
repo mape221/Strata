@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -89,7 +90,7 @@ int main() {
     check(spill.open(dir, id, 1ull << 30, error), "open empty dir");
     check(spill.enabled(), "enabled");
     check(spill.size() == 0, "empty index");
-    check(spill.miss_reason(std::vector<int32_t>{1, 2}, {}, false, 0.0, 64).find("no indexed SSD") !=
+    check(spill.miss_reason("A", std::vector<int32_t>{1, 2}, {}, false, 0.0, 64).find("not indexed") !=
           std::string::npos, "miss: empty disk tier");
 
     std::vector<ConversationCheckpoint> branch_points;
@@ -103,15 +104,17 @@ int main() {
           "sparse checkpoint refuses an invalid tip");
 
     SavedConversation a = sample(1000);
-    check(spill.spill(a, error), "spill first");
+    check(spill.spill("A", a, error), "spill first");
     check(spill.size() == 1, "one entry");
     // the prompt continues the conversation (one token past its end): the whole live state resumes.
     std::vector<int32_t> continuing = a.live.ids;
     continuing.push_back(int32_t(7777));
-    const auto first = spill.best(continuing, a.live.imgs, false, 0.0, 0);
+    const auto first = spill.best("A", continuing, a.live.imgs, false, 0.0, 0);
     check(bool(first), "match own conversation");
     check(first.tokens == (int64_t) a.live.ids.size(), "full prefix match");
     check(first.live, "live match");
+    check(!bool(spill.best("B", continuing, a.live.imgs, false, 0.0, 0)),
+          "an identical prompt with another ID cannot select A's SSD state");
 
     // read it back whole and compare the K/V byte for byte
     SavedConversation back;
@@ -130,40 +133,40 @@ int main() {
     other.resize(400);
     for (size_t i = 400; i < a.live.ids.size(); ++i) other.push_back(int32_t(9000 + i));
     check(other.size() == a.live.ids.size(), "other same length, diverges at 400");
-    const auto partial = spill.best(other, {}, false, 0.0, 0);
+    const auto partial = spill.best("A", other, {}, false, 0.0, 0);
     // the resume lands on the deepest checkpoint still a prefix (250); the 500 checkpoint crosses the divergence.
     check(bool(partial) && partial.tokens == 250, "resume at the deepest still-valid checkpoint");
     check(!partial.live, "checkpoint resume, not live");
 
     // similarity filters a weak hit: 400/1000 = 0.4 LCP is refused at similarity 0.5
-    const auto weak = spill.best(other, {}, false, 0.5, 0);
+    const auto weak = spill.best("A", other, {}, false, 0.5, 0);
     check(!bool(weak), "similarity filters weak hit");
-    check(spill.miss_reason(other, {}, false, 0.5, 0).find("below similarity threshold") !=
+    check(spill.miss_reason("A", other, {}, false, 0.5, 0).find("below similarity threshold") !=
           std::string::npos, "miss: similarity threshold");
     // n_min filters a short hit
-    const auto short_hit = spill.best(std::vector<int32_t>(a.live.ids.begin(), a.live.ids.begin() + 10), {}, false, 0.0, 100);
+    const auto short_hit = spill.best("A", std::vector<int32_t>(a.live.ids.begin(), a.live.ids.begin() + 10), {}, false, 0.0, 100);
     check(!bool(short_hit), "n_min filters short hit");
-    check(spill.miss_reason(other, {}, false, 0.0, 500).find("below minimum shared prefix 500") !=
+    check(spill.miss_reason("A", other, {}, false, 0.0, 500).find("below minimum shared prefix 500") !=
           std::string::npos, "miss: minimum shared prefix");
 
     // A 68k-token conversation with only a late checkpoint has the same failure mode: matching some history
     // is insufficient when no stored running state precedes the point where the client history diverges.
     std::vector<int32_t> before_checkpoint = a.live.ids;
     for (size_t i = 100; i < before_checkpoint.size(); ++i) before_checkpoint[i] += 12345;
-    check(!bool(spill.best(before_checkpoint, {}, false, 0.0, 0)), "divergence before first checkpoint misses");
-    const std::string checkpoint_miss = spill.miss_reason(before_checkpoint, {}, false, 0.0, 0);
+    check(!bool(spill.best("A", before_checkpoint, {}, false, 0.0, 0)), "divergence before first checkpoint misses");
+    const std::string checkpoint_miss = spill.miss_reason("A", before_checkpoint, {}, false, 0.0, 0);
     check(checkpoint_miss.find("index 100") != std::string::npos &&
           checkpoint_miss.find("earliest checkpoint 250") != std::string::npos,
           "miss: exact divergence and first restorable checkpoint");
     std::vector<int32_t> unrelated = a.live.ids;
     unrelated[0] += 12345;
-    check(spill.miss_reason(unrelated, {}, false, 0.0, 0).find("no shared token/image prefix") !=
+    check(spill.miss_reason("A", unrelated, {}, false, 0.0, 0).find("no shared token/image prefix") !=
           std::string::npos, "miss: entirely unrelated prompt");
 
     // cvec mismatch never matches
-    const auto wrong_cvec = spill.best(a.live.ids, a.live.imgs, true, 0.0, 0);
+    const auto wrong_cvec = spill.best("A", a.live.ids, a.live.imgs, true, 0.0, 0);
     check(!bool(wrong_cvec), "cvec mismatch refused");
-    check(spill.miss_reason(a.live.ids, {}, true, 0.0, 0).find("cvec mode") != std::string::npos,
+    check(spill.miss_reason("A", a.live.ids, {}, true, 0.0, 0).find("cvec mode") != std::string::npos,
           "miss: cvec mode");
 
     fs::remove_all(dir);
@@ -172,24 +175,38 @@ int main() {
     SavedConversation image = sample(1000);
     image.live.imgs.push_back({100, 456});
     for (auto& ck : image.checkpoints) ck.imgs.push_back({100, 456});
-    check(with_images.spill(image, error), "save image fixture");
+    check(with_images.spill("image-A", image, error), "save image fixture");
     const std::vector<ConversationImageKey> changed_image{{100, 789}};
-    check(!bool(with_images.best(continuing, changed_image, false, 0.0, 0)),
+    check(!bool(with_images.best("image-A", continuing, changed_image, false, 0.0, 0)),
           "different image identity misses");
-    const std::string image_miss = with_images.miss_reason(continuing, changed_image, false, 0.0, 0);
+    const std::string image_miss = with_images.miss_reason("image-A", continuing, changed_image, false, 0.0, 0);
     check(image_miss.find("index 100") != std::string::npos &&
           image_miss.find("image identity differs") != std::string::npos,
           "miss: image identity and boundary, without content");
+
+    // An anonymous version-1 sidecar has no client ID: do not index it, and leave both files for rollback.
+    const fs::path legacy_meta = dir / "strata-conv-1.meta";
+    {
+        std::fstream file(legacy_meta, std::ios::binary | std::ios::in | std::ios::out);
+        const uint64_t old_version = 1;
+        file.seekp(4);
+        file.write(reinterpret_cast<const char*>(&old_version), sizeof old_version);
+        check(bool(file), "mark fixture as legacy sidecar");
+    }
+    ConversationSpillCache legacy;
+    check(legacy.open(dir, id, 1ull << 30, error), "open directory with anonymous legacy sidecar");
+    check(legacy.size() == 0 && fs::exists(legacy_meta) && fs::exists(dir / "strata-conv-1.sess"),
+          "anonymous legacy files are retained but never indexed by ID");
 
     // reopen the directory: the sidecar is reindexed without reading the session file
     fs::remove_all(dir);
     ConversationSpillCache ordinary;
     check(ordinary.open(dir, id, 1ull << 30, error), "recreate ordinary fixture directory");
-    check(ordinary.spill(a, error), "recreate ordinary fixture");
+    check(ordinary.spill("A", a, error), "recreate ordinary fixture");
     ConversationSpillCache again;
     check(again.open(dir, id, 1ull << 30, error), "reopen dir");
     check(again.size() == 1, "reindexed one entry");
-    const auto rematched = again.best(continuing, a.live.imgs, false, 0.0, 0);
+    const auto rematched = again.best("A", continuing, a.live.imgs, false, 0.0, 0);
     check(bool(rematched) && rematched.tokens == (int64_t) a.live.ids.size(), "rematch after reopen");
 
     // a foreign identity is refused and its files removed
@@ -205,7 +222,7 @@ int main() {
     SavedConversation b = sample(2000);
     b.live.ids[0] += 7777;
     for (auto& c : b.checkpoints) c.ids[0] += 7777;   // a different conversation: no full-prefix supersession
-    check(tight.spill(b, error), "spill second");
+    check(tight.spill("B", b, error), "spill second");
     const uint64_t newest = tight.bytes() - before;   // the newest session file's bytes
     // a budget that fits the newest alone: reopening keeps it and evicts the older one.
     ConversationSpillCache small;
@@ -225,7 +242,10 @@ int main() {
     check(ram.enabled(), "ram cache enabled");
     check(ram.put(std::move(c1)), "put first in RAM");
     size_t spilled = 0;
-    auto spill_cb = [&](const SavedConversation& evicted) { ++spilled; tier.spill(evicted, error); };
+    auto spill_cb = [&](const SavedConversation& evicted) {
+        ++spilled;
+        tier.spill(spilled == 1 ? "A" : "B", evicted, error);
+    };
     // make_room for the second conversation evicts the first and hands it to the callback.
     check(ram.make_room(c2.bytes(), 0, spill_cb), "make_room evicts to make space");
     check(spilled == 1, "one conversation handed to the spill callback");
@@ -233,7 +253,7 @@ int main() {
     // the disk copy resumes the same conversation the RAM cache dropped.
     std::vector<int32_t> cont1 = sample(1000).live.ids;
     cont1.push_back(int32_t(7777));
-    const auto from_disk = tier.best(cont1, sample(1000).live.imgs, false, 0.0, 0);
+    const auto from_disk = tier.best("A", cont1, sample(1000).live.imgs, false, 0.0, 0);
     check(bool(from_disk) && from_disk.tokens == 1000, "disk resumes the evicted conversation");
     // spill_all empties the RAM cache onto disk (the shutdown path).
     check(ram.put(std::move(c2)), "put second in RAM");
@@ -269,8 +289,8 @@ int main() {
         };
         sources.push_back(std::move(src));
     }
-    check(streamed.spill_sources(meta, sources, 1ull << 20, error), "stream the live K/V to disk");
-    const auto disk = streamed.best(std::vector<int32_t>(live.live.ids.begin(), live.live.ids.end()),
+    check(streamed.spill_sources("A", meta, sources, 1ull << 20, error), "stream the live K/V to disk");
+    const auto disk = streamed.best("A", std::vector<int32_t>(live.live.ids.begin(), live.live.ids.end()),
                                      live.live.imgs, false, 0.0, 0);
     check(bool(disk), "disk-only session matches without RAM parking");
     check(disk.checkpoints == 2, "sidecar reports the exact number of retained checkpoints");
@@ -309,18 +329,18 @@ int main() {
         }
     }
     SavedConversation newer = sample(2200);
-    check(streamed.spill(newer, error), "save a longer version of the same chat");
+    check(streamed.spill("A", newer, error), "save a longer version of the same chat");
     check(streamed.size() == 1 && !fs::exists(disk.path), "superseded whole chat removed after new save");
     SavedConversation sibling = sample(2200);
     for (size_t k = 1200; k < sibling.live.ids.size(); ++k) sibling.live.ids[k] += 7777;
-    check(streamed.spill(sibling, error), "save a sibling with the same system prompt");
+    check(streamed.spill("B", sibling, error), "save a sibling with the same system prompt");
     check(streamed.size() == 2, "common root does not merge distinct conversations");
 
     fs::remove_all(dir);
     ConversationSpillCache ttl;
     check(ttl.open(dir, id, 1ull << 30, error), "open fresh TTL directory");
-    check(ttl.spill(sample(1000), error), "save TTL fixture");
-    const auto ttl_path = ttl.best(continuing, {}, false, 0.0, 0).path;
+    check(ttl.spill("A", sample(1000), error), "save TTL fixture");
+    const auto ttl_path = ttl.best("A", continuing, {}, false, 0.0, 0).path;
     check(!ttl_path.empty(), "TTL fixture matched");
     ttl.touched(ttl_path);
     ConversationSpillCache fresh;

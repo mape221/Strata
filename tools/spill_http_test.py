@@ -11,13 +11,16 @@ URL = os.environ.get("STRATA_TEST_URL", "http://127.0.0.1:11436/v1/chat/completi
 ROOT = Path("/mnt/datos/Strata-spill")
 
 
-def request(messages, max_tokens=384):
+def request(messages, max_tokens=384, session_id=None):
     body = {"model": "swift-1.5-iq3_xxs", "messages": messages,
             "temperature": 0, "max_tokens": max_tokens}
-    key = Path("/mnt/datos/Strata/strata-api-key").read_text().strip()
+    headers = {"Content-Type": "application/json"}
+    if session_id:
+        headers["X-Session-Id"] = session_id
+    if os.getenv("STRATA_TEST_API_KEY"):
+        headers["Authorization"] = "Bearer " + os.environ["STRATA_TEST_API_KEY"]
     query = urllib.request.Request(URL, data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json",
-                                            "Authorization": "Bearer " + key})
+                                   headers=headers)
     with urllib.request.urlopen(query, timeout=360) as response:
         data = json.load(response)
     choice = data["choices"][0]
@@ -33,7 +36,7 @@ def main():
         "Responde en español. Esta conversación trata de literatura y océanos. " * 70)}
     a = [system_a, {"role": "user", "content": "dame los primeros 100 numeros primos"}]
     b = [system_b, {"role": "user", "content": "Escribe un poema breve sobre el mar."}]
-    a1, au1 = request(a, 3072)
+    a1, au1 = request(a, 3072, "http-integration-A")
     a.append(a1)
     numbers = [(int(i), int(n)) for i, n in re.findall(
         r"(?m)^\s*(\d+)\.\s+(\d+)\s*$", a1.get("content") or "")]
@@ -41,12 +44,12 @@ def main():
                 if all(n % d for d in range(2, int(n ** 0.5) + 1))]
     print("A1 prime list:", len(numbers), "last:", numbers[-1] if numbers else None,
           "valid:", [n for _, n in numbers] == expected, flush=True)
-    b1, bu1 = request(b)
+    b1, bu1 = request(b, session_id="http-integration-B")
     b.append(b1)
     a.append({"role": "user", "content": "¿Cuál es el primo número 100 de la lista que acabas de dar?"})
-    a2, au2 = request(a)
+    a2, au2 = request(a, session_id="http-integration-A")
     b.append({"role": "user", "content": "Resume tu poema en una frase."})
-    b2, bu2 = request(b)
+    b2, bu2 = request(b, session_id="http-integration-B")
     report = {"A1": {"message": a1, "usage": au1},
               "B1": {"message": b1, "usage": bu1},
               "A2": {"message": a2, "usage": au2},

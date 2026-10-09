@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace strata::core {
@@ -56,46 +57,35 @@ public:
     size_t stale_files_wiped() const { return stale_files_wiped_; }
     size_t disk_evictions() const { return disk_evictions_; }
 
-    // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
-    // n_min filter weak hits exactly as the RAM cache's best() does.
+    // Only the indexed client ID can select an SSD conversation. Its saved token/image prefix is checked afterward
+    // to prevent applying an incompatible K/V state, never to search other IDs.
     template<class Token>
-    ConversationSpillMatch best(const std::vector<Token>& prompt,
-                                const std::vector<ConversationImageKey>& images, bool cvec,
-                                double similarity, int64_t n_min) const {
-        ConversationSpillMatch best_match;
-        int64_t best_tokens = 0;
-        for (size_t i = entries_.size(); i-- > 0;) {
-            const Entry& entry = entries_[i];
-            if (expired(entry)) continue;
-            const ConversationMatch match = conversation_metadata_match(entry.live_meta,
-                    entry.checkpoint_lengths, prompt, images, cvec, entry.cvec, similarity, n_min);
-            if (match.tokens > best_tokens)
-                best_tokens = match.tokens, best_match = {entry.session_path(), entry.file_bytes, match.tokens,
-                                                          match.live, entry.checkpoint_lengths.size()};
-        }
-        return best_match;
+    ConversationSpillMatch best(const std::string& session_id, const std::vector<Token>& prompt,
+                                 const std::vector<ConversationImageKey>& images, bool cvec,
+                                 double similarity, int64_t n_min) const {
+        const auto found = index_.find(session_id);
+        if (session_id.empty() || found == index_.end()) return {};
+        const Entry& entry = entries_[found->second];
+        if (expired(entry)) return {};
+        const ConversationMatch match = conversation_metadata_match(entry.live_meta, entry.checkpoint_lengths,
+                prompt, images, cvec, entry.cvec, similarity, n_min);
+        return match.tokens ? ConversationSpillMatch{entry.session_path(), entry.file_bytes, match.tokens,
+                                                      match.live, entry.checkpoint_lengths.size()} : ConversationSpillMatch{};
     }
 
     // Called only when a request would reread the entire prompt and best() found nothing. Report why the closest
     // indexed session cannot be resumed; token/image contents and IDs never enter the log.
     template<class Token>
-    std::string miss_reason(const std::vector<Token>& prompt,
+    std::string miss_reason(const std::string& session_id, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images, bool cvec,
                             double similarity, int64_t n_min) const {
-        if (entries_.empty()) return "no indexed SSD conversations for this model/config (none saved, expired, or evicted)";
+        const auto found = index_.find(session_id);
+        if (found == index_.end()) return "session ID is not indexed on SSD (new, expired, or evicted)";
         if (prompt.empty()) return "incoming prompt is empty";
-        const Entry* closest = nullptr;
-        int64_t shared = -1;
-        size_t active = 0;
-        for (const Entry& entry : entries_) {
-            if (expired(entry)) continue;
-            ++active;
-            if (entry.cvec != cvec) continue;
-            const int64_t lcp = conversation_lcp(entry.live_meta, prompt, images);
-            if (lcp > shared) { closest = &entry; shared = lcp; }
-        }
-        if (!closest) return active == 0 ? "all indexed SSD conversations expired before lookup"
-                                         : "no indexed SSD conversation with matching cvec mode";
+        const Entry* closest = &entries_[found->second];
+        if (expired(*closest)) return "session ID expired on SSD";
+        if (closest->cvec != cvec) return "session ID has a different cvec mode";
+        const int64_t shared = conversation_lcp(closest->live_meta, prompt, images);
         const std::string name = closest->stem.filename().string();
         std::string detail = "closest " + name + " (" + std::to_string(closest->live_meta.ids.size()) +
                              " saved tokens): shared prefix " + std::to_string(shared) +
@@ -126,10 +116,10 @@ public:
     bool load_streamed(const std::string& path, SavedConversation& meta, const SessionReadLimits& limits,
                        std::vector<std::array<uint64_t, 5>>& sizes, std::string& error) const;
     // Writes a parked conversation (its K/V in RAM) as a session file plus its sidecar, and indexes it.
-    bool spill(const SavedConversation& image, std::string& error);
+    bool spill(const std::string& session_id, const SavedConversation& image, std::string& error);
     // A live session's K/V stays on its device: stream the authoritative buffers to disk instead of first
     // allocating a SavedConversation containing the whole K/V in RAM.
-    bool spill_sources(const SavedConversation& meta, const std::vector<SessionKvSource>& sources,
+    bool spill_sources(const std::string& session_id, const SavedConversation& meta, const std::vector<SessionKvSource>& sources,
                        uint64_t min_free_bytes, std::string& error);
     bool erase(const std::string& path, std::string& error);
     void prune_expired();
@@ -137,14 +127,11 @@ public:
     // A conversation being restored is held out of eviction until it is put back in RAM or dropped.
     void pin(const std::string& path);
     void unpin(const std::string& path);
-    // Removes the disk copies of this conversation a turn back, the same rule the RAM cache applies before evicting.
-    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
-                            const std::string& keep_path = {});
 
 private:
     struct Entry {
         std::filesystem::path stem;          // "<dir>/strata-conv-<serial>" (both files share it)
+        std::string session_id;
         uint64_t file_bytes = 0;
         std::filesystem::file_time_type used_at{};
         bool cvec = true;
@@ -156,8 +143,10 @@ private:
     void enforce_budget();
     bool expired(const Entry& entry) const;
     std::filesystem::path fresh_stem();
-    bool index_written(const std::filesystem::path& stem, const SavedConversation& image,
-                       size_t file_bytes, std::string& error);
+    bool index_written(const std::filesystem::path& stem, const std::string& session_id,
+                       const SavedConversation& image,
+                        size_t file_bytes, std::string& error);
+    void rebuild_index();
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
     bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
 
@@ -168,6 +157,7 @@ private:
     size_t stale_files_wiped_ = 0, disk_evictions_ = 0;
     std::filesystem::path directory_;
     std::vector<Entry> entries_;   // oldest spill first
+    std::unordered_map<std::string, size_t> index_;  // client ID -> metadata held in RAM
     std::string pinned_path_;
 };
 

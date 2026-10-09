@@ -487,6 +487,7 @@ class ConvCacheLog:
     which is the log): read on from where it was last read, from the start of the engine's current run."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
+    CONV = re.compile(r"strata-conv-(\d+)")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
@@ -496,7 +497,7 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "last_conv": None}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
@@ -520,6 +521,9 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            cm = self.CONV.search(line)
+            if cm:
+                self.state["last_conv"] = int(cm.group(1))
             if "conversation cache:" not in line:
                 continue
             m = self.EVENT.search(line)
@@ -1173,7 +1177,7 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
-    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None, session_id=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
         its prompt + what it generated: the engine reuses that prefix).  Otherwise: BGEN into a free slot, then the
@@ -1186,7 +1190,7 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        keys = self.sampling_keys(sampling or {}) + (f" sid={session_id}" if session_id else "")
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1468,20 +1472,20 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session_id=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         if getattr(self, "batch", 0):
-            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
+            yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session_id=session_id)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {}) + (f" sid={session_id}" if session_id else "")
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -2167,6 +2171,7 @@ def engine_args(cfg: dict) -> list[str]:
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value)."""
     args = list(cfg["args"])
+    args = ssd_kv_cache_session_args(cfg, args)
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
@@ -2193,6 +2198,84 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     return learned_profile_args(cfg, args)
+
+
+def ssd_kv_cache_session_args(cfg: dict, args: list[str]) -> list[str]:
+    """Optional, typed JSON control for the SSD conversation tier. Old configs without this section keep their args."""
+    section = cfg.get("ssd-kv-cache-sessions")
+    if section is None and "ssd-kv-cache-sessions" not in cfg:
+        return args
+    if not isinstance(section, dict) or set(section) - {"enabled", "directory", "max_size_gib", "ttl_hours"}:
+        raise ValueError('"ssd-kv-cache-sessions" needs an object with enabled, directory, max_size_gib, ttl_hours')
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError('"ssd-kv-cache-sessions.enabled" must be true or false')
+    flags = {"--conversation-cache-spill-dir", "--conversation-cache-disk-mib", "--conversation-cache-ttl-s"}
+    clean = []
+    i = 0
+    while i < len(args):
+        if args[i] in flags:
+            if i + 1 >= len(args):
+                raise ValueError(f'"args": {args[i]} needs a value')
+            i += 2
+        else:
+            clean.append(args[i])
+            i += 1
+    if not enabled:
+        return clean
+    directory = section.get("directory")
+    if not isinstance(directory, str) or not directory.strip() or any(c in directory for c in "\r\n\0"):
+        raise ValueError('"ssd-kv-cache-sessions.directory" must be a nonempty directory path')
+    size = section.get("max_size_gib", 32)
+    hours = section.get("ttl_hours", 24)
+    if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 2097151:
+        raise ValueError('"ssd-kv-cache-sessions.max_size_gib" must be an integer between 1 and 2097151')
+    if isinstance(hours, bool) or not isinstance(hours, int) or not 1 <= hours <= (2**63 - 1) // 3600:
+        raise ValueError('"ssd-kv-cache-sessions.ttl_hours" must be a positive integer')
+    return clean + ["--conversation-cache-spill-dir", directory,
+                    "--conversation-cache-disk-mib", str(size * 1024),
+                    "--conversation-cache-ttl-s", str(hours * 3600)]
+
+
+def client_session_id(headers, req: dict) -> str | None:
+    """Optional OpenAI/Anthropic client ID; no ID means the engine must never inspect its SSD session index."""
+    values = [x for x in (headers.get("X-Session-Id"), headers.get("x-session-affinity"),
+                          req.get("session_id")) if x is not None]
+    if any(not isinstance(x, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", x) for x in values):
+        raise ValueError("session ID must be 1..128 ASCII letters, digits, '.', '_', ':' or '-'")
+    if len(set(values)) > 1:
+        raise ValueError("X-Session-Id, x-session-affinity and session_id must agree")
+    return values[0] if values else None
+
+
+# OpenCode 1.18.35 sends the same tools in Build and Plan but removes the "general" subagent from
+# task's description in Plan. The model template renders tools before every chat turn, so even one
+# changed description invalidates the entire K/V prefix. Stabilize the rendered text, not the
+# actual tools: Plan's permission.task.general=deny and the request's real tool list still apply.
+_TASK_GENERAL_DESCRIPTION = (
+    "- general: General-purpose agent for researching complex questions and executing multi-step tasks. "
+    "Use this agent to execute multiple units of work in parallel. Available in Build mode only; "
+    "in Plan mode use explore instead."
+)
+
+
+def stable_prompt_tools(tools):
+    if not tools:
+        return tools
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            result.append(tool)
+            continue
+        description = tool.get("description")
+        if tool.get("name") != "task" or not isinstance(description, str) or \
+                "Available agent types and the tools they have access to:" not in description or \
+                not any(line.startswith("- explore: ") for line in description.splitlines()):
+            result.append(tool)
+            continue
+        lines = [line for line in description.splitlines() if not line.startswith("- general: ")]
+        result.append({**tool, "description": "\n".join(lines) + "\n" + _TASK_GENERAL_DESCRIPTION})
+    return result
 
 
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
@@ -2604,6 +2687,7 @@ class Service:
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+        self.request_session = threading.local()       # optional client session ID, isolated per HTTP request
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
@@ -3152,6 +3236,7 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        tools = stable_prompt_tools(tools)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -3325,7 +3410,7 @@ class Service:
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
-            text = self.template.render(marked, tools=marked_tools, **kw)
+            text = self.template.render(marked, tools=stable_prompt_tools(marked_tools), **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
@@ -3490,8 +3575,13 @@ class Service:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        session_id = getattr(self.request_session, "value", None)
+                        if session_id and isinstance(self.engine, StrataEngine):
+                            gen = self.engine.generate(prompt, max_new - n, sampling, cancel,
+                                                       embeddings=emb, session_id=session_id)
+                        else:
+                            gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
+                                else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
@@ -3699,7 +3789,10 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                "conv": (self.conv_log.poll(getattr(self.engine, "log_path", None),
+                                         getattr(self.engine, "log_start", None)) or {}).get("last_conv"),
+                                "session": getattr(self.request_session, "value", None)})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -4597,6 +4690,7 @@ def make_handler(svc: Service):
         def _post(self):
             if not self._authorized():
                 return
+            svc.request_session.value = None
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
@@ -4673,6 +4767,7 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    svc.request_session.value = client_session_id(self.headers, req)
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -4726,6 +4821,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
             finally:
+                svc.request_session.value = None
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
@@ -5696,7 +5792,11 @@ def main() -> int:
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
+        try:
+            configured_args = engine_args(cfg)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}") from e
+        warn_budget_over_ram(configured_args)      # #1080
         if layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
@@ -5717,7 +5817,7 @@ def main() -> int:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+        engine = StrataEngine(exe, configured_args + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                               env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))

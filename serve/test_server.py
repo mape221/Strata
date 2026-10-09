@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                           StrataEngine, api_key_of, client_session_id, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -1959,6 +1959,43 @@ class PeerDevice(unittest.TestCase):
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
 
 
+class SSDKvCacheSessions(unittest.TestCase):
+    def test_json_section_and_legacy_args(self):
+        old = ["--pack", "pack", "--conversation-cache-spill-dir", "old",
+               "--conversation-cache-disk-mib", "8192", "--conversation-cache-ttl-s", "3600"]
+        self.assertEqual(engine_args({"args": old}), old)
+        cfg = {"args": old, "ssd-kv-cache-sessions": {"enabled": False}}
+        self.assertEqual(engine_args(cfg), ["--pack", "pack"])
+        cfg["ssd-kv-cache-sessions"] = {"enabled": True, "directory": "/ssd/kv", "max_size_gib": 32,
+                                        "ttl_hours": 24}
+        self.assertEqual(engine_args(cfg), ["--pack", "pack", "--conversation-cache-spill-dir", "/ssd/kv",
+                                            "--conversation-cache-disk-mib", "32768", "--conversation-cache-ttl-s", "86400"])
+        self.assertEqual(engine_args({"args": [], "ssd-kv-cache-sessions": {"enabled": True,
+                                                                              "directory": "/ssd/kv"}}),
+                         ["--conversation-cache-spill-dir", "/ssd/kv", "--conversation-cache-disk-mib", "32768",
+                          "--conversation-cache-ttl-s", "86400"])
+
+    def test_invalid_configuration_is_rejected(self):
+        for options in (None, [], {"enabled": 1}, {"enabled": True},
+                        {"enabled": True, "directory": "x\n"},
+                        {"enabled": True, "directory": "/ssd", "max_size_gib": 0},
+                        {"enabled": True, "directory": "/ssd", "ttl_hours": True}, {"unknown": 1}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                engine_args({"args": [], "ssd-kv-cache-sessions": options})
+
+    def test_client_id_opt_in_and_agreement(self):
+        self.assertIsNone(client_session_id({}, {}))
+        self.assertEqual(client_session_id({"x-session-affinity": "ses_123"}, {}), "ses_123")
+        self.assertEqual(client_session_id({"X-Session-Id": "pi-session-2"}, {}), "pi-session-2")
+        self.assertEqual(client_session_id({}, {"session_id": "request.id:1"}), "request.id:1")
+        self.assertEqual(client_session_id({"X-Session-Id": "same", "x-session-affinity": "same"}, {}), "same")
+        for headers, body in (({"X-Session-Id": "A", "x-session-affinity": "B"}, {}),
+                              ({"X-Session-Id": "bad value"}, {}), ({}, {"session_id": 123}),
+                              ({}, {"session_id": ""}), ({}, {"session_id": "x" * 129})):
+            with self.subTest(headers=headers, body=body), self.assertRaises(ValueError):
+                client_session_id(headers, body)
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
     begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
@@ -2592,6 +2629,34 @@ class TemplateCaps(unittest.TestCase):
             with mock.patch.object(ChatTemplate, "render", side_effect=RuntimeError("render bug")):
                 caps = ChatTemplate(path).caps       # any error of a probe is a feature that is off, not a crash
             self.assertFalse(any(caps.values()))
+
+
+    def test_plan_build_task_description_keeps_prompt_prefix(self):
+        # Plan omits the general subagent from task's description; its actual permission and tool
+        # lists must stay untouched while the model-facing text remains byte-for-byte stable.
+        import copy
+
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "OK"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        shared = ("Launch an agent.\n\nAvailable agent types and the tools they have access to:\n"
+                  "- explore: Read-only research agent.")
+        plan = [{"name": "task", "description": shared, "parameters": {"type": "object"}},
+                {"name": "read", "description": "Read a file", "parameters": {"type": "object"}}]
+        build = copy.deepcopy(plan)
+        build[0]["description"] += ("\n- general: General-purpose agent for researching complex questions and "
+                                     "executing multi-step tasks. Use this agent to execute multiple units of work "
+                                     "in parallel.")
+        original = copy.deepcopy((build, plan))
+        messages = [{"role": "system", "content": "Help."}, {"role": "user", "content": "Review the file."}]
+        self.assertEqual(svc.encode_prompt(messages, build, {}), svc.encode_prompt(messages, plan, {}))
+        self.assertEqual((build, plan), original)
+        prompt = svc.render_prompt(messages, plan, {})
+        self.assertIn("Available in Build mode only; in Plan mode use explore instead.", prompt)
+
+        changed_read = copy.deepcopy(plan)
+        changed_read[1]["description"] = "Different read tool"
+        self.assertNotEqual(svc.encode_prompt(messages, build, {}),
+                            svc.encode_prompt(messages, changed_read, {}))
 
 
 class WebApp(unittest.TestCase):

@@ -17,8 +17,9 @@ def chat(text):
     return f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
-def generate(engine, ids, count=48):
-    engine.send(f"GEN {count} " + ",".join(map(str, ids)))
+def generate(engine, ids, count=48, session_id=None):
+    key = f" sid={session_id}" if session_id else ""
+    engine.send(f"GEN {count}{key} " + ",".join(map(str, ids)))
     tokens = []
     for line in engine.lines():
         if line.startswith("T "):
@@ -53,7 +54,8 @@ def run():
     os.environ["BATCH_TEST_LOG"] = str(ROOT / f"integration-{name}.log")
 
     def start():
-        return Engine(str(ROOT / "build" / "strata"), cfg, 0, {"STRATA_IQ_MT_MIN": "1"}, extra)
+        return Engine(os.getenv("SPILL_ENGINE", str(ROOT / "build" / "strata")), cfg, 0,
+                      {"STRATA_IQ_MT_MIN": "1"}, extra)
 
     engine = start()
     stop = threading.Event()
@@ -69,12 +71,12 @@ def run():
     watcher = threading.Thread(target=sample_ram, daemon=True)
     watcher.start()
     try:
-        a1, _ = generate(engine, pa)
-        b1, _ = generate(engine, pb)
+        a1, _ = generate(engine, pa, session_id="integration-A")
+        b1, _ = generate(engine, pb, session_id="integration-B")
         pa2 = follow(tok, pa, a1, "Give two related keywords.")
-        a2, reused_a = generate(engine, pa2)
+        a2, reused_a = generate(engine, pa2, session_id="integration-A")
         pb2 = follow(tok, pb, b1, "Give a third metaphor.")
-        b2, reused_b = generate(engine, pb2)
+        b2, reused_b = generate(engine, pb2, session_id="integration-B")
         engine.send("QUIT")
         engine.p.wait(timeout=180)
         log = Path(os.environ["BATCH_TEST_LOG"]).read_text()
@@ -97,7 +99,7 @@ def run():
     restarted = start()
     try:
         pa3 = follow(tok, pa2, a2, "Now give one more keyword.")
-        _, reused_restart = generate(restarted, pa3)
+        _, reused_restart = generate(restarted, pa3, session_id="integration-A")
         restarted.send("QUIT")
         restarted.p.wait(timeout=180)
         log = Path(os.environ["BATCH_TEST_LOG"]).read_text()

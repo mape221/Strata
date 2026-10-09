@@ -7090,8 +7090,10 @@ int main(int argc, char** argv) {
         // conversation and a hand-saved session file are interchangeable.
         strata::core::ConversationSpillCache conversation_spill;
         strata::core::SessionFileIdentity spill_identity;
+        std::string live_session_id;  // ID of the conversation whose K/V is currently in the single-GPU session
         if (o.serve && o.prompt_cache > 0 && use_mtp && o.batch == 0 &&
-            !o.conversation_cache_spill_dir.empty() && o.conversation_cache_disk_mib > 0 && stages.empty()) {
+            !o.conversation_cache_spill_dir.empty() && o.conversation_cache_disk_mib > 0 && stages.empty() &&
+            !conversations.enabled()) {
             std::string identity_error;
             if (!session_identity(spill_identity, identity_error, nullptr)) {
                 std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", identity_error.c_str());
@@ -7110,10 +7112,10 @@ int main(int argc, char** argv) {
             }
         }
         auto spill_evicted = [&](const strata::core::SavedConversation& evicted) {
-            if (!conversation_spill.enabled()) return;
+            if (!conversation_spill.enabled() || live_session_id.empty()) return;
             try {
                 std::string spill_error;
-                if (conversation_spill.spill(evicted, spill_error)) {
+                if (conversation_spill.spill(live_session_id, evicted, spill_error)) {
                     std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB); disk=%zu MiB "
                                  "disk_evictions=%zu\n", evicted.live.ids.size(), evicted.bytes() >> 20,
                                  (size_t) (conversation_spill.bytes() >> 20), conversation_spill.disk_evictions());
@@ -7132,7 +7134,6 @@ int main(int argc, char** argv) {
             for (const auto& checkpoint : checks) freed += checkpoint.bytes();
             auto* deepest = strata::core::session_deepest_checkpoint(checks);
             const size_t index = (size_t) (deepest - checks.data());
-            const size_t deepest_tokens = deepest->ids.size();
             // Keep an older branch point as well as the tip when RAM allows it. A client may resume with a
             // slightly rewritten history: the tip then has no common prefix, but the older checkpoint can.
             const size_t anchor = strata::core::conversation_spill_anchor(checks, index);
@@ -7163,7 +7164,7 @@ int main(int argc, char** argv) {
         // one snapshot's worth of free RAM: one or two checkpoints, running state and one file block are held.
         int64_t rewind_checkpoint_to_preserve = 0;
         auto spill_live = [&]() {
-            if (!conversation_spill.enabled() || !live_ok || live.empty()) return;
+            if (!conversation_spill.enabled() || live_session_id.empty() || !live_ok || live.empty()) return;
             // A sibling prompt can resume from a checkpoint in the current conversation. The disk writer moves
             // checks into the saved image, and the request below still needs one of them to restore the shared
             // prefix. Leave this outgoing branch in RAM until that restore has finished; otherwise the request
@@ -7226,7 +7227,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: disk session skipped (%s)\n", why.c_str());
                     return;
                 }
-                if (!conversation_spill.spill_sources(meta, sources,
+                if (!conversation_spill.spill_sources(live_session_id, meta, sources,
                         (uint64_t) o.session_min_free_mib << 20, why)) {
                     std::fprintf(stderr, "strata serve: disk session write skipped (%s)\n", why.c_str());
                     return;
@@ -7238,11 +7239,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: disk session skipped (not enough RAM)\n");
             }
         };
-        // Save only on a switch/rewind, not on each continuing request. No graph
-        // addresses change: all parked images live in ordinary host vectors.
-        auto park_current_body = [&](size_t held) -> bool {
+        // Only a different client session displacing live K/V may write the disk tier. A rewind within the
+        // same session or the first request on an empty device has nothing to evict to SSD.
+        auto park_current_body = [&](size_t held, bool switching_session) -> bool {
             if (!conversations.enabled() && conversation_spill.enabled()) {
-                spill_live();
+                // A rewind within the same client session is not an eviction to SSD.
+                if (switching_session) spill_live();
                 return true;
             }
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
@@ -7251,10 +7253,6 @@ int main(int argc, char** argv) {
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
-            const size_t disk_dropped = conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached);
-            if (disk_dropped)
-                std::fprintf(stderr, "strata serve: conversation cache: removed %zu superseded disk conversation%s\n",
-                             disk_dropped, disk_dropped == 1 ? "" : "s");
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -7391,8 +7389,8 @@ int main(int argc, char** argv) {
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
-        auto park_current = [&](size_t held) -> bool {
-            try { return park_current_body(held); }
+        auto park_current = [&](size_t held, bool switching_session) -> bool {
+            try { return park_current_body(held, switching_session); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
@@ -9159,6 +9157,7 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    live_session_id.clear();  // manual slot restore has no client session ID
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
@@ -9193,6 +9192,8 @@ int main(int argc, char** argv) {
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
             int64_t req_pin = 0;
+            std::string req_session_id; // sid=... is optional; absent requests never query or save the SSD tier
+            bool bad_session_id = false;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -9209,6 +9210,14 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "sid") {
+                        req_session_id = tok.substr(eq + 1);
+                        if (req_session_id.empty() || req_session_id.size() > 128 ||
+                            !std::all_of(req_session_id.begin(), req_session_id.end(), [](unsigned char c) {
+                                return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                       (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-';
+                            })) bad_session_id = true;
+                    }
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -9233,6 +9242,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
+            if (bad_session_id) { std::printf("ERR invalid session ID\n"); continue; }
             if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
@@ -9383,7 +9393,8 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            const bool same_active_session = !conversation_spill.enabled() || req_session_id == live_session_id;
+            if (o.prompt_cache > 0 && same_active_session && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -9413,22 +9424,24 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            if (conversation_spill.enabled() && !conversations.enabled() && live_ok && !live.empty() &&
-                resume == 0 && slot_source < 0) trim_disk_checkpoints();
+            if (conversation_spill.enabled() && !live_session_id.empty() && !conversations.enabled() && live_ok && !live.empty() &&
+                !same_active_session && resume == 0 && slot_source < 0) trim_disk_checkpoints();
             auto parked = conversations.best(ids, req_imgs, want_cvec,
                                               o.conversation_cache_similarity, o.conversation_cache_n_min);
             std::optional<strata::core::SavedConversation> incoming;
             bool incoming_from_disk = false;
             std::string incoming_disk_path;
             std::vector<std::array<uint64_t, 5>> incoming_kv;
-            conversation_spill.prune_expired();
+            if (!req_session_id.empty()) conversation_spill.prune_expired();
             // The sidecar identifies a conversation without reading its K/V.  The disk read validates the complete
             // file but retains only running state and headers: K/V stays on disk until the selected session is applied.
-            const auto disk_match = conversation_spill.best(ids, req_imgs, want_cvec,
-                                                              o.conversation_cache_similarity, o.conversation_cache_n_min);
-            if (conversation_spill.enabled() && !disk_match && resume == 0 && slot_source < 0 && parked.tokens == 0)
+            const auto disk_match = req_session_id.empty() ? strata::core::ConversationSpillMatch{} :
+                conversation_spill.best(req_session_id, ids, req_imgs, want_cvec,
+                                        o.conversation_cache_similarity, o.conversation_cache_n_min);
+            if (conversation_spill.enabled() && !req_session_id.empty() && !disk_match &&
+                resume == 0 && slot_source < 0 && parked.tokens == 0)
                 std::fprintf(stderr, "strata serve: disk session miss: %s\n",
-                             conversation_spill.miss_reason(ids, req_imgs, want_cvec,
+                             conversation_spill.miss_reason(req_session_id, ids, req_imgs, want_cvec,
                                  o.conversation_cache_similarity, o.conversation_cache_n_min).c_str());
             if (!disk_match.path.empty() && disk_match.tokens > std::max(resume, std::max(slot_tokens, parked.tokens))) {
                 conversation_spill.pin(disk_match.path);
@@ -9516,7 +9529,7 @@ int main(int argc, char** argv) {
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
             // (a sibling query of the last one).  What the last query added past it is its private suffix - a few
             // dozen tokens, cheaper to read than the prefix's whole K/V is to copy to the host - so it is not parked:
-            // N queries keep one prefix.  A request without pin=, or one that resumes anywhere else, parks as before.
+            // N queries keep one prefix. Only replacing the active session parks its outgoing K/V on disk.
             bool pin_sibling = false;
             if (req_pin > 0 && req_ckpt && o.prompt_cache >= 3 && !from_live && !incoming && slot_source < 0 &&
                 resume == req_pin && live_ok)
@@ -9524,7 +9537,7 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             rewind_checkpoint_to_preserve = !from_live && !incoming && slot_source < 0 ? resume : 0;
             const bool parked_ok = (from_live && !incoming && slot_source < 0) || pin_sibling ||
-                                   park_current(incoming ? incoming->bytes() : 0);
+                                   park_current(incoming ? incoming->bytes() : 0, !same_active_session);
             rewind_checkpoint_to_preserve = 0;
             if (!parked_ok) {
                 std::printf("ERR %s\n", err.c_str());
@@ -9679,6 +9692,9 @@ int main(int argc, char** argv) {
                     err.clear();
                 }
             }
+            // From here the device/checkpoints belong to this request, including if it is cancelled midway.
+            // A later request must not treat the half-read state as the previous client's ID.
+            if (conversation_spill.enabled()) live_session_id = req_session_id;
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();
@@ -11185,6 +11201,7 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+                live_session_id = req_session_id;
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
@@ -11502,10 +11519,7 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
-        if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
-            if (!park_current(0))
-                std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",
-                             err.c_str());
+        if (conversation_spill.enabled()) {   // Only conversations displaced by another session go to disk.
             const size_t resident = conversations.spill_all(spill_evicted);
             std::fprintf(stderr, "strata serve: conversation cache: shutdown spilled %zu parked conversations; disk=%zu MiB "
                          "disk_evictions=%zu\n", resident, (size_t) (conversation_spill.bytes() >> 20),

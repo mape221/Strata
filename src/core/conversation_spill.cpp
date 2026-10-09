@@ -15,7 +15,7 @@ namespace strata::core {
 namespace {
 
 constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-spill metadata
-constexpr uint32_t kMetaVersion = 1;
+constexpr uint32_t kMetaVersion = 2;  // v1 has no client ID; leave those files untouched for rollback
 constexpr size_t kMaxSidecarEntries = 256;
 
 // A small length-delimited writer/reader for the sidecar, with a trailing hash of the payload (the same
@@ -76,6 +76,13 @@ bool valid_meta_chain(const ConversationCheckpoint& live, const std::vector<size
     return true;
 }
 
+bool valid_session_id(const std::string& id) {
+    return !id.empty() && id.size() <= 128 && std::all_of(id.begin(), id.end(), [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '.' || c == '_' || c == ':' || c == '-';
+    });
+}
+
 } // namespace
 
 bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
@@ -90,11 +97,22 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
     char magic[4];
     uint64_t version = 0;
     uint64_t model = 0, config = 0;
-    if (!r.raw(magic, 4) || std::memcmp(magic, kMetaMagic, 4) != 0 || !r.u64(version) || version != kMetaVersion ||
+    if (!r.raw(magic, 4) || std::memcmp(magic, kMetaMagic, 4) != 0 || !r.u64(version)) {
+        error = "unknown spill sidecar magic or version"; return false;
+    }
+    if (version == 1) { other_identity = true; return false; }  // old anonymous cache: not indexed by an ID
+    if (version != kMetaVersion ||
         !r.u64(model) || !r.u64(config)) {
         error = "unknown spill sidecar magic or version"; return false;
     }
     if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
+    uint64_t id_size = 0;
+    if (!r.u64(id_size) || id_size == 0 || id_size > 128 || id_size > r.remaining()) {
+        error = "invalid session ID in sidecar"; return false;
+    }
+    entry.session_id.resize((size_t) id_size);
+    if (!r.raw(entry.session_id.data(), (size_t) id_size)) { error = "truncated session ID in sidecar"; return false; }
+    if (!valid_session_id(entry.session_id)) { error = "invalid session ID in sidecar"; return false; }
     uint64_t cvec = 0;
     if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
     entry.cvec = cvec != 0;
@@ -123,6 +141,7 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         if (!out) { error = "cannot create spill sidecar"; return false; }
         MetaWriter w(out);
         if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(identity_.model) || !w.u64(identity_.config) ||
+            !w.u64(entry.session_id.size()) || !w.raw(entry.session_id.data(), entry.session_id.size()) ||
             !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
         }
@@ -152,6 +171,7 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
     stale_files_wiped_ = 0;
     disk_evictions_ = 0;
     entries_.clear();
+    index_.clear();
     bytes_ = 0;
     pinned_path_.clear();
     directory_ = directory;
@@ -210,6 +230,7 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
         std::stable_sort(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) {
             return a.used_at < b.used_at;
         });
+        rebuild_index();
         // session files with no sidecar left behind (a crash between the two writes) go too.
         for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
             const auto status = it->symlink_status(ec);
@@ -227,10 +248,10 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
         stale_files_wiped_ = stale;
         return true;
     } catch (const std::bad_alloc&) {
-        entries_.clear(); bytes_ = 0; enabled_ = false;
+        entries_.clear(); index_.clear(); bytes_ = 0; enabled_ = false;
         error = "not enough RAM to index spill directory"; return false;
     } catch (const std::exception& e) {
-        entries_.clear(); bytes_ = 0; enabled_ = false;
+        entries_.clear(); index_.clear(); bytes_ = 0; enabled_ = false;
         error = std::string("cannot index spill directory: ") + e.what(); return false;
     }
 }
@@ -261,9 +282,14 @@ std::filesystem::path ConversationSpillCache::fresh_stem() {
     return stem;
 }
 
+void ConversationSpillCache::rebuild_index() {
+    index_.clear();
+    for (size_t i = 0; i < entries_.size(); ++i) index_[entries_[i].session_id] = i;
+}
+
 bool ConversationSpillCache::index_written(const std::filesystem::path& stem,
-                                            const SavedConversation& image, size_t file_bytes,
-                                            std::string& error) {
+                                             const std::string& session_id, const SavedConversation& image, size_t file_bytes,
+                                             std::string& error) {
     std::error_code ec;
     const std::string session = stem.string() + ".sess";
     if (file_bytes > budget_) {
@@ -273,6 +299,7 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem,
     }
     Entry entry;
     entry.stem = stem;
+    entry.session_id = session_id;
     entry.file_bytes = file_bytes;
     entry.used_at = std::filesystem::file_time_type::clock::now();
     entry.cvec = image.cvec;
@@ -288,16 +315,22 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem,
         error = "not enough RAM to index conversation spill file"; return false;
     }
     bytes_ += file_bytes;
-    // Replace older versions of the same conversation only after the new file and sidecar were published.
-    // In particular, a failed save must leave the last usable version on disk.
-    drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, session);
+    // Replace this ID's old version only after the new file and sidecar were published. Other IDs are untouched,
+    // even if they share every token; a failed write leaves the old copy available.
+    for (size_t i = 0; i + 1 < entries_.size();) {
+        if (entries_[i].session_id != session_id || entries_[i].session_path() == pinned_path_) { ++i; continue; }
+        std::string erase_error;
+        if (!erase(entries_[i].session_path(), erase_error)) ++i;
+    }
+    rebuild_index();
     prune_expired();
     enforce_budget();
     return true;
 }
 
-bool ConversationSpillCache::spill(const SavedConversation& image, std::string& error) {
+bool ConversationSpillCache::spill(const std::string& session_id, const SavedConversation& image, std::string& error) {
     if (!enabled_) return false;
+    if (!valid_session_id(session_id)) { error = "invalid client session ID"; return false; }
     if (image.live.ids.empty() || !image.stage_images.empty()) { error = "spill needs a single-GPU conversation"; return false; }
     std::error_code ec;
     const std::filesystem::path stem = fresh_stem();
@@ -310,13 +343,14 @@ bool ConversationSpillCache::spill(const SavedConversation& image, std::string& 
         std::filesystem::remove(session, ec);
         return false;
     }
-    return index_written(stem, image, file_bytes, error);
+    return index_written(stem, session_id, image, file_bytes, error);
 }
 
-bool ConversationSpillCache::spill_sources(const SavedConversation& meta,
+bool ConversationSpillCache::spill_sources(const std::string& session_id, const SavedConversation& meta,
                                           const std::vector<SessionKvSource>& sources,
                                           uint64_t min_free_bytes, std::string& error) {
     if (!enabled_) return false;
+    if (!valid_session_id(session_id)) { error = "invalid client session ID"; return false; }
     if (meta.live.ids.empty() || !meta.stage_images.empty()) {
         error = "spill needs a single-GPU conversation"; return false;
     }
@@ -326,7 +360,7 @@ bool ConversationSpillCache::spill_sources(const SavedConversation& meta,
     options.min_free_bytes = min_free_bytes;
     size_t file_bytes = 0;
     if (!session_file_write(session, meta, sources, identity_, file_bytes, error, options)) return false;
-    return index_written(stem, meta, file_bytes, error);
+    return index_written(stem, session_id, meta, file_bytes, error);
 }
 
 bool ConversationSpillCache::erase(const std::string& path, std::string& error) {
@@ -340,6 +374,7 @@ bool ConversationSpillCache::erase(const std::string& path, std::string& error) 
     bytes_ -= found->file_bytes;
     if (pinned_path_ == path) pinned_path_.clear();
     entries_.erase(found);
+    rebuild_index();
     return true;
 }
 
@@ -376,47 +411,7 @@ void ConversationSpillCache::touched(const std::string& path) {
     entries_.erase(found);
     entry.used_at = now;
     entries_.push_back(std::move(entry));
-}
-
-size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
-                                                const std::vector<ConversationImageKey>& images,
-                                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
-                                                const std::string& keep_path) {
-    (void) checkpoints;
-    size_t dropped = 0;
-    for (size_t i = 0; i < entries_.size();) {
-        const Entry& entry = entries_[i];
-        // A common system-prompt checkpoint is NOT proof that these are the same chat.  Remove an older disk file
-        // only when its complete conversation (tokens and pictures) is a prefix of the new completed conversation.
-        auto same_conversation = [&] {
-            const size_t length = entry.live_meta.ids.size();
-            if (length == 0 || length > ids.size() ||
-                !std::equal(entry.live_meta.ids.begin(), entry.live_meta.ids.end(), ids.begin())) return false;
-            size_t a = 0, b = 0;
-            while ((a < entry.live_meta.imgs.size() && entry.live_meta.imgs[a].start < (int64_t) length) ||
-                   (b < images.size() && images[b].start < (int64_t) length)) {
-                if (a == entry.live_meta.imgs.size() || entry.live_meta.imgs[a].start >= (int64_t) length ||
-                    b == images.size() || images[b].start >= (int64_t) length ||
-                    !(entry.live_meta.imgs[a] == images[b])) return false;
-                ++a;
-                ++b;
-            }
-            return true;
-        };
-        if (entry.cvec == cvec && same_conversation() && entry.session_path() != pinned_path_ &&
-            entry.session_path() != keep_path) {
-            std::error_code ec;
-            std::filesystem::remove(entry.session_path(), ec);
-            std::filesystem::remove(entry.meta_path(), ec);
-            if (ec) { ++i; continue; }
-            bytes_ -= entry.file_bytes;
-            entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-            ++dropped;
-            continue;
-        }
-        ++i;
-    }
-    return dropped;
+    rebuild_index();
 }
 
 void ConversationSpillCache::enforce_budget() {
@@ -428,6 +423,7 @@ void ConversationSpillCache::enforce_budget() {
         if (ec) { ++i; continue; }
         bytes_ -= entries_[i].file_bytes;
         entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+        rebuild_index();
         ++disk_evictions_;
     }
 }
