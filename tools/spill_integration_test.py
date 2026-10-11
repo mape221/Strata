@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-ROOT = Path("/mnt/datos/Strata-spill")
+ROOT = Path(os.getenv("SPILL_TEST_ROOT", "/mnt/datos/Strata-spill"))
 sys.path.insert(0, str(ROOT / "tools"))
 from batch_test import Engine, tokenizer  # noqa: E402
 
@@ -118,7 +118,8 @@ def run():
         original_log = os.environ["BATCH_TEST_LOG"]
         os.environ["BATCH_TEST_LOG"] = str(ROOT / f"integration-{name}-reference.log")
         ordinary = ["--pcie-frac", "0", "--adapt-every", "1000000"]
-        reference = Engine(str(ROOT / "build" / "strata"), cfg, 0, {"STRATA_IQ_MT_MIN": "1"}, ordinary)
+        reference = Engine(os.getenv("SPILL_ENGINE", str(ROOT / "build" / "strata")), cfg, 0,
+                           {"STRATA_IQ_MT_MIN": "1"}, ordinary)
         try:
             _, _ = generate(reference, pa)
             a2_reference, reused_reference = generate(reference, pa2)

@@ -7,10 +7,10 @@ import re
 import urllib.request
 from pathlib import Path
 
-root = Path("/mnt/datos/Strata-spill")
+root = Path(os.getenv("SPILL_TEST_ROOT", "/mnt/datos/Strata-spill"))
 log = Path(os.getenv("SESSION_ID_TEST_LOG", root / "session-id-test-engine.log"))
 cache = Path(os.getenv("SESSION_ID_TEST_CACHE", root / "cache-test-session-id"))
-endpoint = "http://127.0.0.1:11436/v1/chat/completions"
+endpoint = os.getenv("STRATA_TEST_URL", "http://127.0.0.1:11436/v1/chat/completions")
 
 
 def ask(messages, session_id=None, transport="header"):
