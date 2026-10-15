@@ -180,6 +180,23 @@ Más problemas y sus soluciones: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.
 [issue](https://github.com/Niko1221/Strata/issues) y adjunta `strata-<model>.log` de la carpeta de Strata. ¿Has
 encontrado un problema de seguridad? Infórmalo en privado: [SECURITY.md](SECURITY.md).
 
+## Registro de peticiones de sesiones (opcional)
+
+Al iniciar el servidor con `--log-request-session`, Strata guarda las últimas 20 peticiones HTTP con un
+`X-Session-Id`, `x-session-affinity` o `session_id` válido. Conserva el cuerpo recibido, las cabeceras, el estado y
+el cuerpo exacto de la respuesta (también si es streaming) en `./session-requests.jsonl`, con acceso privado al
+usuario del servidor. Las credenciales de las cabeceras se ocultan; **el contenido del cuerpo puede incluir datos
+sensibles**. No está relacionado con `--api-monitor` y está desactivado por defecto.
+
+```bash
+python -m serve.server --engine strata --config strata.json --log-request-session
+python -m serve.server --engine strata --config strata.json --log-request-session \
+  --log-request-session-path /ruta/privada/session-requests.jsonl --log-request-session-limit 50
+```
+
+El límite es global entre sesiones y sobrevive reinicios. Solo limita el número de entradas, no su tamaño. La ruta
+personalizada debe tener un directorio existente; si el archivo ya existe debe ser un archivo regular privado.
+
 ## ¿Cómo funciona?
 
 Los modelos como este suelen funcionar en servidores con cientos de gigabytes de memoria gráfica. Tu tarjeta gráfica

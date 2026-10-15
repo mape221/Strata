@@ -64,6 +64,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve.session_request_log import SessionRequestLog, body_text, safe_headers  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2892,6 +2893,7 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.request_session = threading.local()       # optional client session ID, isolated per HTTP request
+        self.session_request_log: SessionRequestLog | None = None  # opt-in, persistent session HTTP traces
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
@@ -4687,12 +4689,53 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             self.answer_started = False
+            self.session_request = None
+            self.session_output = None
             super().handle_one_request()
             self._drain_body()
 
         def send_response(self, code, message=None):
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
+            if self.session_request is not None:
+                self.session_request["response"]["status"] = code
             super().send_response(code, message)
+
+        def send_header(self, keyword, value):
+            """Anota las cabeceras salientes de una petición identificada, sin credenciales."""
+            if self.session_request is not None:
+                self.session_request["response"]["headers"].extend(safe_headers([(keyword, value)]))
+            super().send_header(keyword, value)
+
+        def _write(self, data):
+            """Escribe la respuesta y conserva exactamente los bytes enviados cuando el log está activo."""
+            written = self.wfile.write(data)
+            if self.session_output is not None:
+                try:
+                    self.session_output.write(data if written is None else data[:written])
+                except OSError as e:
+                    print(f"[strata] session request log capture failed: {e}", flush=True)
+                    with contextlib.suppress(OSError):
+                        self.session_output.close()
+                    self.session_output = None
+                    self.session_request = None
+            return written
+
+        def _save_session_request(self):
+            """Persiste petición y respuesta completas sin hacer fallar la solicitud HTTP si falla el disco."""
+            if self.session_request is None:
+                return
+            try:
+                self.session_output.seek(0)
+                self.session_request["response"].update(body_text(self.session_output.read()))
+                self.session_request["finished_at"] = time.time()
+                svc.session_request_log.append(self.session_request)
+            except (OSError, ValueError, TypeError) as e:
+                print(f"[strata] session request log failed: {e}", flush=True)
+            finally:
+                with contextlib.suppress(OSError):
+                    self.session_output.close()
+                self.session_output = None
+                self.session_request = None
 
         def _chunked(self) -> bool:
             """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
@@ -4871,6 +4914,8 @@ def make_handler(svc: Service):
             if self.record is not None:
                 with svc.status_lock:
                     self.record.update(values)
+            if self.session_request is not None:
+                self.session_request["response"].update(values)
 
         def _cors(self):
             """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
@@ -4915,7 +4960,7 @@ def make_handler(svc: Service):
             self._cors()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self._write(body)
 
         def _authorized(self) -> bool:
             if not svc.api_key:
@@ -5118,7 +5163,8 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self._body() or b"{}")
+                raw_body = self._body()
+                req = json.loads(raw_body or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
@@ -5162,6 +5208,23 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     svc.request_session.value = client_session_id(self.headers, req)
+                    if svc.session_request_log is not None and svc.request_session.value is not None:
+                        try:
+                            self.session_output = tempfile.SpooledTemporaryFile(max_size=1 << 20, mode="w+b")
+                            self.session_request = {
+                                "type": "session_request", "session_id": svc.request_session.value,
+                                "started_at": time.time(), "method": self.command, "path": self.path,
+                                "http_version": self.request_version,
+                                "client_address": self.client_address[0],
+                                "headers": safe_headers(self.headers.items()), **body_text(raw_body),
+                                "response": {"status": None, "headers": []},
+                            }
+                        except OSError as e:
+                            print(f"[strata] session request log capture failed: {e}", flush=True)
+                            if self.session_output is not None:
+                                with contextlib.suppress(OSError):
+                                    self.session_output.close()
+                            self.session_output = None
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -5230,6 +5293,7 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+                self._save_session_request()
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -5475,11 +5539,11 @@ def make_handler(svc: Service):
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        self._write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
                     else:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        self._write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
-                self.wfile.write(b"data: [DONE]\n\n")
+                self._write(b"data: [DONE]\n\n")
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
@@ -5487,15 +5551,15 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -5504,7 +5568,7 @@ def make_handler(svc: Service):
             self._sse()
             try:
                 for e in events:
-                    self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
+                    self._write(f"event: {e['type']}\n".encode() + b"data: " +
                                      json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
             except OSError:
@@ -5565,7 +5629,7 @@ def make_handler(svc: Service):
             last = time.monotonic()
 
             def send(e):
-                self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
+                self._write(f"event: {e['type']}\n".encode() + b"data: " +
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
 
             try:
@@ -5577,7 +5641,7 @@ def make_handler(svc: Service):
                             send(asm.in_progress())
                             last = time.monotonic()
                         else:
-                            self.wfile.write(b": keep-alive\n\n")
+                            self._write(b": keep-alive\n\n")
                     else:
                         send(e)
                         last = time.monotonic()
@@ -5693,10 +5757,10 @@ def make_handler(svc: Service):
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        self._write(b": keep-alive\n\n")
                     else:
                         name, e = item
-                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                        self._write(f"event: {name}\n".encode() + b"data: " +
                                          json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
             except OSError:
@@ -5706,11 +5770,11 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                self._write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                self._write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
     return Handler
 
@@ -6263,6 +6327,13 @@ def main() -> int:
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
+    ap.add_argument("--log-request-session", action="store_true",
+                    help="save complete HTTP requests and responses with a session ID to a private JSONL file "
+                         "(off by default; last 20 requests globally)")
+    ap.add_argument("--log-request-session-path", default=None, metavar="FILE",
+                    help="session request log file (default: ./session-requests.jsonl)")
+    ap.add_argument("--log-request-session-limit", type=int, default=None, metavar="N",
+                    help="number of session requests to retain across restarts (default: 20)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -6280,6 +6351,11 @@ def main() -> int:
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
+    if not a.log_request_session and (a.log_request_session_path is not None or a.log_request_session_limit is not None):
+        ap.error("--log-request-session-path and --log-request-session-limit need --log-request-session")
+    a.log_request_session_limit = 20 if a.log_request_session_limit is None else a.log_request_session_limit
+    if a.log_request_session_limit < 1:
+        ap.error("--log-request-session-limit must be positive")
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
@@ -6379,6 +6455,14 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if a.log_request_session:
+        try:
+            svc.session_request_log = SessionRequestLog(a.log_request_session_path or "session-requests.jsonl",
+                                                         a.log_request_session_limit)
+        except (OSError, ValueError) as e:
+            ap.error(str(e))
+        print(f"[strata] session request log on: {svc.session_request_log.path} "
+              f"(last {svc.session_request_log.limit} requests with session ID; contains full bodies)", flush=True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
